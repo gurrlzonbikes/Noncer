@@ -1,152 +1,114 @@
 # Noncer
 
-**High-stakes / low-frequency automation gate:** run a command only when a **Ledger-signed EIP-712 intent** matches on-chain **identity** (recoverable signature), **eligibility** (ERC-721 balance > 0), and the gate’s **monotonic application nonce**.
+**Noncer** is a small **gate** in front of a real process on a machine you run. A high-stakes action only runs if a **Ledger**-backed key has signed a structured **intent** (EIP-712), a **public chain** still says the sender is **allowed** via an **AccessControl** registry (`hasRole`), the **next** application **nonce** matches what the gate expects, and the signed `action` is only a **key** into a local **allow-list** of fixed `argv` (no shell). That stack is a way to think about **governed automation** without making that one path depend on a long-lived **bearer API key** for authorization.
 
-No API keys. The trust model is **hardware key + structured signing + on-chain eligibility + explicit sequence** (not long-lived CI secrets).
-
----
-
-## Model
-
-| Piece | Role |
-|--------|------|
-| **Intent (EIP-712)** | Typed data: `Intent(nonce, action, policyCommitment)` under domain `Noncer` / chainId / `verifyingContract` — shown on Ledger during **step 1** |
-| **Tx** | Self-transfer whose `data` is **ABI v1** (see below); signed on Ledger **step 2** |
-| **Eligibility** | `balanceOf(sender) > 0` for a configured NFT |
-| **Nonce** | Application nonce in the typed message must equal gate state; incremented **only after successful execution** |
-| **Replay** | Each mined tx handled **once** (persisted tx-hash set) |
-| **Execution** | The EIP-712 **`action`** string is an **intent key** only. The gate maps it to a **fixed argv** via a local **allow-list file** — **no shell** (`shell=False`). |
-
-### Calldata v1 (single tx)
-
-Prefix byte `0x01`, then ABI:
-
-`abi.encode(uint256 nonce, string action, bytes32 policyCommitment, uint8 v, bytes32 r, bytes32 s)`
-
-where `v,r,s` are the **EIP-712** signature over the intent (not the tx signature). The gate **recovers** the signer address and requires it to equal `tx.from` (and passes NFT + nonce checks).
+It is **opinionated and heavy** on purpose: keys, chain, and a second device flow. That is a bad trade for “run tests on every push” and a reasonable trade for “this run can do real damage or touch real data if it is the wrong person or the wrong order.”
 
 ---
 
-## Ledger UX (two prompts)
+## Problem / non-goals
 
-1. **Sign EIP-712 intent** — structured fields on device (`nonce`, `action`, `policyCommitment`, domain). Here **`action`** is the **same string** as the allow-list key (e.g. `scan-staging`).
-2. **Sign the EIP-1559 transaction** that carries the packed calldata (may present as data signing / blind depending on firmware).
+**What it is trying to address**
+
+- Pipelines and agents often get **broad secrets**; anyone with the token can do a lot.
+- **Revocation** and “who was allowed when” are easy to lose in a pile of internal configs.
+- You may want a **dumb executor** (the gate) that does not implement your org’s full policy in custom code—only checks you can state **from the outside** (signer, on-chain flag, sequence, then a **fixed** local command table).
+
+**What it is *not* (use something else)**
+
+- **Not** a drop-in for **OIDC / workload identity** for normal CI or SaaS login at scale.
+- **Not** a **privacy** system: relevant txs and addresses are **public** on the chain you use.
+- **Not** optimized for **latency** or **volume** (Ledger + RPC + confirmation).
+
+**When to bother**
+
+If the worst case is “the pipeline turns red,” you probably do not need this shape. If the worst case is “wrong human or wrong order runs **this** binary against **that** environment,” the split above is what this repo is experimenting with.
 
 ---
 
-## Architecture
+## Mechanism (bullet map)
 
-```text
-noncer emit  →  Node signer:
-                  1) Ledger.signEIP712Message (or hashed fallback)
-                  2) pack calldata v1 + Ledger.signTransaction → broadcast
+- **Identity:** EIP-712 `Intent(nonce, action, policyCommitment)` + broadcast tx → both signed on Ledger (`action` = allow-list **key**, not argv).
+- **Live allow:** OpenZeppelin-style `hasRole(RUNNER_ROLE, sender)` on **`NoncerGateRegistry`** (**killswitch:** admin calls `revokeRunner(sender)` — see `contracts/`).
+- **Ordering:** Gate stores next **application nonce** per address; bumps only after successful argv run.
+- **Execution:** `allowlist.json` maps keys → argv; `subprocess` **without** shell.
 
-noncer-watch →  decode v1 → ecrecover EIP-712 digest → must match from
-               → NFT → application nonce → argv from allow-list JSON
-               → GET /nonce for emit
-```
+**Calldata v1:** `0x01 || abi.encode(nonce, action, policyCommitment, v, r, s)` — gate recovers EIP-712 signer, requires `recover == tx.from`, then eligibility + nonce + argv.
+
+**Flow:** `noncer emit` → Ledger ×2 → Base Sepolia · `noncer-watch` → decode → verify → allow-list argv · HTTP `GET /nonce` for expected nonce.
 
 ---
 
-## Command allow-list (required)
+## Allow-list (required)
 
-The gate **does not** interpret `action` as a shell command. Create a JSON file (default path: `$NONCER_STATE_DIR/allowlist.json`, usually `~/.noncer/allowlist.json`):
+Default: `~/.noncer/allowlist.json` · override: `--allowlist` / `NONCER_ALLOWLIST`
 
 ```json
-{
-  "commands": {
-    "echo-demo": ["/bin/echo", "hello"],
-    "true-cmd": ["/bin/true"]
-  }
-}
+{"commands": {"echo-demo": ["/bin/echo", "hello"], "true-cmd": ["/bin/true"]}}
 ```
 
-- Keys must match the **`action`** field in the signed intent **exactly** (after trim).
-- Values are **argv arrays**: first element is the executable; remaining entries are literal arguments controlled by **you**, not by the signer’s string parsing.
-
-Override path: `--allowlist /path/to/allowlist.json` or env **`NONCER_ALLOWLIST`**.
-
-Optional **`--strict-executable`** (or **`NONCER_STRICT_EXECUTABLE=1`**): require `argv[0]` to exist on disk and be executable (recommended on production gate hosts).
+Optional: `--strict-executable` / `NONCER_STRICT_EXECUTABLE=1` (require `argv[0]` exists + executable).
 
 ---
 
 ## Prerequisites
 
-- **Python** ≥ 3.10, **Node.js** + `npm install` at repo root (Ledger + `ethers`).
-- Ledger **Ethereum** app; enable **contract / typed data** signing per device docs.
-- **NFT** on **Base Sepolia** (chain id **84532** default).
-- RPC URL (default `https://sepolia.base.org`).
+- Python ≥3.10, `npm install` at repo root (Ledger signer), Ledger (Ethereum app, typed data).
+- Base Sepolia **gas**; deploy **`NoncerGateRegistry`** and **`grantRunner`** your emitter address.
+- Default RPC `https://sepolia.base.org`, chain `84532`.
+
+### Registry deploy
+
+See **`contracts/README.md`**: Hardhat + OpenZeppelin `AccessControl`; constructor sets **admin** (use a multisig). Admin grants **`grantRunner(0xEmitter)`**; emergency **`revokeRunner(0xEmitter)`** removes eligibility without touching the gate host.
 
 ---
 
 ## Install
 
 ```bash
-git clone https://github.com/<your-org>/noncer.git
-cd noncer
-
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/<your-org>/noncer.git && cd noncer
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
-
 npm install
 ```
 
 ---
 
-## Configure
+## Env (common)
 
-Match **EIP-712 domain** between CLI and watcher (`name`, `version`, `chainId`, `verifyingContract`).
-
-| Env / flag | Meaning |
-|------------|---------|
-| `NONCER_STATE_DIR` | Gate persistence (`~/.noncer`): `gate_state.json`, default **allow-list** path |
-| `NONCER_ALLOWLIST` | Path to allow-list JSON (overrides default `<state-dir>/allowlist.json`) |
-| `NONCER_STRICT_EXECUTABLE` | `1` / `true`: same as watcher `--strict-executable` |
-| `NONCER_RPC_URL` | HTTP RPC |
-| `NONCER_CHAIN_ID` | Default `84532` (Base Sepolia) |
-| `NONCER_GATE_URL` | CLI `GET /nonce` target (default `http://127.0.0.1:3090`) |
-| `NONCER_EIP712_NAME` / `NONCER_EIP712_VERSION` | Domain (defaults `Noncer` / `1`) |
-| `NONCER_VERIFYING_CONTRACT` | EIP-712 `verifyingContract` (default zero address) |
-| `NONCER_POLICY_COMMITMENT` | Default `bytes32` for CLI (64 hex chars); manifest hash |
-| `NONCER_EXPECTED_POLICY_COMMITMENT` | If set on watcher, intent must use this **exact** `policyCommitment` |
+| Var / flag | Role |
+|------------|------|
+| `NONCER_STATE_DIR` | State + default allow-list dir (`~/.noncer`) |
+| `NONCER_ALLOWLIST` | Allow-list path |
+| `NONCER_RPC_URL` / `NONCER_CHAIN_ID` | RPC / chain (default Sepolia Base) |
+| `NONCER_GATE_URL` | Nonce HTTP for CLI (default `http://127.0.0.1:3090`) |
+| `NONCER_EIP712_*`, `NONCER_VERIFYING_CONTRACT` | Must match between **emit** and **watch** |
+| `NONCER_POLICY_*`, `NONCER_EXPECTED_POLICY_COMMITMENT` | Optional policy bytes32 binding |
+| `NONCER_REGISTRY_CONTRACT` | Registry address (`--registry-contract`) |
+| `NONCER_RUNNER_ROLE` | Optional bytes32 hex for `hasRole` (default `keccak256("RUNNER")`) |
 
 ---
 
-## Run the gate
+## Run
+
+**Gate**
 
 ```bash
-# Ensure ~/.noncer/allowlist.json exists (or pass --allowlist)
-noncer-watch --nft-contract 0xYourERC721Address \
-  --eip712-name Noncer --eip712-version 1
+noncer-watch --registry-contract 0xYourDeployedRegistry
 ```
 
-Optional: `--expected-policy-commitment 0x...`, `--strict-executable`.
-
----
-
-## Emit
-
-Use an **`action`** string that matches an allow-list key:
+**Emit** (`--action` = allow-list key)
 
 ```bash
-noncer emit \
-  --address 0xYourAddress \
-  --derivation-path "44'/60'/0'/0/0" \
+noncer emit --address 0x… --derivation-path "44'/60'/0'/0/0" \
   --action echo-demo \
   --policy-commitment 0x0000000000000000000000000000000000000000000000000000000000000000
 ```
 
-Use the same domain flags as the watcher if you override defaults.
-
----
-
-## Revocation
-
-NFT **transfer/burn** updates eligibility on-chain without a separate revoke API.
+Watcher up for `/nonce`, or pass `--nonce N`.
 
 ---
 
 ## Status
 
-Experimental. Execution is **argv templates only** (allow-list JSON); extend with tighter policy manifests via `policyCommitment` as needed.
+Experimental—harden RPC trust, `/nonce` exposure, and policy for non-lab use.

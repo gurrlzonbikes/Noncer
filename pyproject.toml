@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "noncer"
 version = "0.4.0"
-description = "Hardware-signed on-chain intents with NFT eligibility and monotonic application nonce."
+description = "Hardware-signed on-chain intents with AccessControl registry eligibility and monotonic nonce."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

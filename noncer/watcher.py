@@ -1,5 +1,5 @@
 """
-Chain watcher + gate: NFT eligibility, monotonic application nonce, EIP-712 verification.
+Chain watcher + gate: AccessControl ``hasRole`` eligibility, monotonic nonce, EIP-712.
 
 Exposes HTTP ``GET /nonce?address=0x...`` so ``noncer emit`` can learn the next expected nonce.
 """
@@ -10,8 +10,10 @@ import argparse
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -29,15 +31,30 @@ from noncer.state import GateState, default_state_dir
 
 logger = logging.getLogger(__name__)
 
-ERC721_MIN_ABI = [
+ACCESS_CONTROL_HAS_ROLE_ABI = [
     {
-        "constant": True,
-        "inputs": [{"name": "owner", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "", "type": "uint256"}],
+        "inputs": [
+            {"name": "role", "type": "bytes32"},
+            {"name": "account", "type": "address"},
+        ],
+        "name": "hasRole",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
         "type": "function",
     }
 ]
+
+
+def _parse_runner_role_hex(s: str | None) -> bytes:
+    """Default: same as Solidity ``keccak256(bytes('RUNNER'))`` / ``RUNNER_ROLE`` constant."""
+    if not s or not str(s).strip():
+        return bytes(Web3.keccak(text="RUNNER"))
+    h = str(s).strip().lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if len(h) != 64:
+        raise ValueError("runner-role must be 32 bytes (64 hex chars)")
+    return bytes.fromhex(h)
 
 
 def _run_gate_http(
@@ -103,7 +120,7 @@ def process_tx(
     tx: Any,
     tx_hash_hex: str,
     state: GateState,
-    nft: Any,
+    is_eligible: Callable[[str], bool],
     w3: Web3,
     domain_name: str,
     domain_version: str,
@@ -127,14 +144,14 @@ def process_tx(
     sender_cs = Web3.to_checksum_address(sender)
 
     try:
-        bal = nft.functions.balanceOf(sender_cs).call()
+        ok = is_eligible(sender_cs)
     except Exception as e:
-        logger.error("balanceOf failed for %s: %s", sender_cs, e)
+        logger.error("eligibility check failed for %s: %s", sender_cs, e)
         state.mark_tx_seen(tx_hash_hex)
         return
 
-    if bal <= 0:
-        logger.info("Not eligible (no NFT): %s", sender_cs)
+    if not ok:
+        logger.info("Not eligible: %s", sender_cs)
         state.mark_tx_seen(tx_hash_hex)
         return
 
@@ -224,7 +241,6 @@ def process_tx(
 def watch_forever(
     *,
     rpc_url: str,
-    nft_contract: str,
     state: GateState,
     poll_seconds: float,
     bind_host: str,
@@ -236,13 +252,21 @@ def watch_forever(
     expected_policy_bytes: bytes | None,
     commands: dict[str, list[str]],
     strict_executable: bool,
+    registry_contract: str,
+    runner_role_bytes: bytes,
 ) -> None:
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     if not w3.is_connected():
         raise RuntimeError(f"cannot connect to RPC: {rpc_url}")
 
-    nft_addr = w3.to_checksum_address(nft_contract)
-    nft = w3.eth.contract(address=nft_addr, abi=ERC721_MIN_ABI)
+    reg_addr = w3.to_checksum_address(registry_contract)
+    reg = w3.eth.contract(address=reg_addr, abi=ACCESS_CONTROL_HAS_ROLE_ABI)
+    rr = runner_role_bytes
+
+    def is_eligible(addr: str) -> bool:
+        return reg.functions.hasRole(rr, addr).call()
+
+    elig_label = f"registry={reg_addr} role={rr.hex()}"
 
     if http_enabled:
         t = threading.Thread(
@@ -254,7 +278,7 @@ def watch_forever(
         t.start()
         logger.info("Gate HTTP on http://%s:%s/nonce", bind_host, gate_port)
 
-    logger.info("Watching chain via %s NFT=%s chainId=%s", rpc_url, nft_addr, int(w3.eth.chain_id))
+    logger.info("Watching chain via %s eligibility=%s chainId=%s", rpc_url, elig_label, int(w3.eth.chain_id))
 
     while True:
         try:
@@ -272,7 +296,7 @@ def watch_forever(
                         tx=tx,
                         tx_hash_hex=h,
                         state=state,
-                        nft=nft,
+                        is_eligible=is_eligible,
                         w3=w3,
                         domain_name=domain_name,
                         domain_version=domain_version,
@@ -306,9 +330,18 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    p = argparse.ArgumentParser(description="Noncer gate: watch chain, enforce EIP-712 + nonce + NFT")
+    p = argparse.ArgumentParser(description="Noncer gate: EIP-712 + nonce + AccessControl eligibility")
     p.add_argument("--rpc-url", default=os.environ.get("NONCER_RPC_URL", "https://sepolia.base.org"))
-    p.add_argument("--nft-contract", required=True, help="ERC-721 checksummed or hex address")
+    p.add_argument(
+        "--registry-contract",
+        default=os.environ.get("NONCER_REGISTRY_CONTRACT"),
+        help="AccessControl contract (e.g. NoncerGateRegistry); env: NONCER_REGISTRY_CONTRACT",
+    )
+    p.add_argument(
+        "--runner-role",
+        default=os.environ.get("NONCER_RUNNER_ROLE"),
+        help="bytes32 hex for hasRole (default: keccak256('RUNNER') matching NoncerGateRegistry.RUNNER_ROLE)",
+    )
     p.add_argument(
         "--state-dir",
         type=Path,
@@ -343,6 +376,14 @@ def main() -> None:
 
     args = p.parse_args()
 
+    if not args.registry_contract:
+        print("--registry-contract is required (or set NONCER_REGISTRY_CONTRACT)", file=sys.stderr)
+        sys.exit(2)
+    try:
+        runner_role_bytes = _parse_runner_role_hex(args.runner_role)
+    except ValueError as e:
+        raise SystemExit(f"invalid --runner-role: {e}") from e
+
     try:
         policy_bytes = _parse_policy_hex(args.expected_policy_commitment)
     except ValueError as e:
@@ -366,7 +407,6 @@ def main() -> None:
 
     watch_forever(
         rpc_url=args.rpc_url,
-        nft_contract=args.nft_contract,
         state=state,
         poll_seconds=args.poll_interval,
         bind_host=args.gate_host,
@@ -378,6 +418,8 @@ def main() -> None:
         expected_policy_bytes=policy_bytes,
         commands=commands,
         strict_executable=strict_exe,
+        registry_contract=args.registry_contract,
+        runner_role_bytes=runner_role_bytes,
     )
 
 

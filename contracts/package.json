@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "name": "noncer-contracts",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy-base-sepolia": "hardhat run scripts/deploy.js --network baseSepolia"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.2"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.17"
+  }
+}

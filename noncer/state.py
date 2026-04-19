@@ -40,14 +40,11 @@ class GateState:
         key = address_checksum.lower()
         return int(self._data["nonces"].get(key, 0))
 
-    def set_expected_nonce(self, address_checksum: str, value: int) -> None:
-        key = address_checksum.lower()
-        self._data["nonces"][key] = value
-        self._save()
-
     def increment_nonce(self, address_checksum: str) -> None:
-        n = self.get_expected_nonce(address_checksum)
-        self.set_expected_nonce(address_checksum, n + 1)
+        key = address_checksum.lower()
+        n = int(self._data["nonces"].get(key, 0))
+        self._data["nonces"][key] = n + 1
+        self._save()
 
     def has_seen_tx(self, tx_hash_hex: str) -> bool:
         h = tx_hash_hex.lower().removeprefix("0x")
