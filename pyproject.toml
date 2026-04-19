@@ -1,0 +1,9 @@
+[project]
+name = "noncer"
+version = "0.1.0"
+
+[tool.setuptools]
+packages = ["noncer"]
+
+[project.scripts]
+noncer = "noncer.cli.main:main"
